@@ -1,0 +1,5 @@
+__pycache__/
+items/
+logs/
+venv_ews/
+templates/
