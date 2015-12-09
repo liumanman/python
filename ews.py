@@ -4,6 +4,7 @@ import os
 import time
 import json
 import sys
+from functools import partial
 from decimal import Decimal
 from enum import Enum
 from jinja2 import Environment, FileSystemLoader
@@ -111,13 +112,15 @@ class ItemEWS(EWS):
                        'fixed': 'FixedPriceItem'}
 
     @staticmethod
-    def get_item_name(item_file_name):
+    def get_item_name(item_file_path):
+        item_file_name = os.path.basename(item_file_path)
         return item_file_name.split('.')[0]
 
     @staticmethod
     def update_item_ebay_info(item_file, ebay_id, list_fee, **kwargs):
         item_name = ItemEWS.get_item_name(os.path.basename(item_file))
-        abs_item_file_path = item_file if os.path.isabs(item_file) else os.path.abspath(item_file)
+        # abs_item_file_path = item_file if os.path.isabs(item_file) else os.path.abspath(item_file)
+        abs_item_file_path = os.path.abspath(item_file)
         item_file_dir = os.path.dirname(abs_item_file_path)
 
         ebay_file_path = os.path.join(item_file_dir, '{}.{}'.format(item_name, 'ebay'),
@@ -141,6 +144,32 @@ class ItemEWS(EWS):
 
         to_file(ebay_file_path, ebay_content)
 
+    @staticmethod
+    def _get_item_dict_from_res(res, fields):
+        root = xml_dom.parseString(res).documentElement
+        item_dict = {v:root.getElementsByTagName(v)[0].childNodes[0].data for v in fields}
+        return item_dict
+
+    @staticmethod
+    def _get_pic_base_url(pic_url):
+        tmp_url = pic_url.split('?')[0]
+        i = tmp_url.rfind('/$_')
+        if i == -1:
+            raise Exception('Invalid pic url.')
+        return tmp_url[: i + 3]
+
+    @staticmethod
+    def _read_resp(res):
+        root = xml_dom.parseString(res).documentElement
+        ebay_id = root.getElementsByTagName('ItemID')[0].childNodes[0].data
+        fee_nodes = (Decimal(i.childNodes[0].data) for i in root.getElementsByTagName('Fee') if
+                     i.childNodes[0].nodeType == i.TEXT_NODE)
+        return ebay_id, sum(fee_nodes)
+
+    @classmethod
+    def _is_item_picture(cls, item_name, file_name):
+        tmp = file_name.split('.')
+        return tmp[0] == item_name and tmp[-1] in cls._item_pic_type.split('|')
 
     def __init__(self, item_file_dir='.'):
         self.item_file_dir = item_file_dir
@@ -148,14 +177,12 @@ class ItemEWS(EWS):
         super().__init__()
 
     def _get_abs_item_file_path(self, file_name):
-        if os.path.isabs(file_name):
-            return file_name
-        else:
-            return os.path.join(self.item_file_dir, file_name)
+        return os.path.join(self.item_file_dir, file_name)
 
     def _update_item(self, update_type, item_file):
-        item_name = ItemEWS.get_item_name(os.path.basename(item_file))
-        abs_item_file_path = item_file if os.path.isabs(item_file) else os.path.join(self.item_file_dir, item_file) 
+        item_name = ItemEWS.get_item_name(item_file)
+        # abs_item_file_path = item_file if os.path.isabs(item_file) else os.path.join(self.item_file_dir, item_file) 
+        abs_item_file_path = self._get_abs_item_file_path(item_file)
         item_dict = jreader.read(abs_item_file_path)
         item_dict = self._convert_item_dict(item_dict)
         if 'pictures' not in item_dict:
@@ -165,72 +192,43 @@ class ItemEWS(EWS):
         is_success, res = super().call(template_name, api_name, reference_number=item_name, **item_dict)
         if not is_success:
             raise Exception(res)
-        ebay_id, fee = self._read_resp(res)
-        # self._save_ebay_info(ebay_id, fee,
-        #                      item_file, item_name)
+        ebay_id, fee = ItemEWS._read_resp(res)
         ItemEWS.update_item_ebay_info(abs_item_file_path, ebay_id, fee)
         return ebay_id, fee
 
-    def _get_item_ebay_info(self, ebay_id=None, file_name=None, *fields):
+    def _get_item_info_from_ebay(self, ebay_id=None, file_name=None, *fields):
         if not ebay_id:
             if not file_name:
-                pass
+                raise Exception('ebay_id and file_name can''t be null both.')
             item_dict = jreader.read(file_name)
             ebay_id = item_dict['ebay_id']
         is_success, res = super().call('get_item.xml', 'GetItem', reference_number=ebay_id, ebay_id=ebay_id)
         if not is_success:
             raise Exception(res)
-        ebay_item_dict = self.__class__._get_item_dict_from_res(res, fields)
         if not fields:
             return res
+        ebay_item_dict = self.__class__._get_item_dict_from_res(res, fields)
         if len(ebay_item_dict) == 1:
             return ebay_item_dict[fields[0]]
         else:
             return ebay_item_dict
 
-    @staticmethod
-    def _get_item_dict_from_res(res, fields):
-        root = xml_dom.parseString(res).documentElement
-        item_dict = {v:root.getElementsByTagName(v)[0].childNodes[0].data for v in fields}
-        return item_dict
-
     def _get_item_pictures(self, item_name):
         file_list = os.listdir(self.item_file_dir)
-
-        def f(x):
-            return x[0] == item_name and x[-1] in ItemEWS._item_pic_type.split('|')
-        picture_list = [i for i in file_list if f(i.split('.'))]
+        picture_list = [i for i in file_list if self.__class__._is_item_picture(item_name, i)]
         return picture_list
 
     def _upload_pictures(self, item_name, item_file):
         pic_path_list = self._get_item_pictures(item_name)
         if not pic_path_list:
             raise Exception("Can't find any picture for item {}".format(item_name))
-
-        def f(x):
-            return x if os.path.isabs(x) else os.path.join(self.item_file_dir, x)
-        pic_abs_path_list = list(map(f, pic_path_list))
+        pic_abs_path_list = list(map(self._get_abs_item_file_path, pic_path_list))
         pic_url_list = self.pic_srv.upload(*pic_abs_path_list)
-        pic_base_url = self._get_pic_base_url(pic_url_list[0])
-        item_file_abs_path = os.path.join(self.item_file_dir, item_file)
+        pic_base_url = ItemEWS._get_pic_base_url(pic_url_list[0])
+        item_file_abs_path = self._get_abs_item_file_path(item_file)
         jreader.update_json_file({'pictures': pic_url_list, '_pic_base_url': pic_base_url},
                                  item_file_abs_path)
         return pic_url_list
-
-    def _get_pic_base_url(self, pic_url):
-        tmp_url = pic_url.split('?')[0]
-        i = tmp_url.rfind('/$_')
-        if i == -1:
-            raise Exception('Invalid pic url.')
-        return tmp_url[: i + 3]
-
-    def _read_resp(self, res):
-        root = xml_dom.parseString(res).documentElement
-        ebay_id = root.getElementsByTagName('ItemID')[0].childNodes[0].data
-        fee_nodes = (Decimal(i.childNodes[0].data) for i in root.getElementsByTagName('Fee') if
-                     i.childNodes[0].nodeType == i.TEXT_NODE)
-        return ebay_id, sum(fee_nodes)
-
 
     def add_item(self, item_file):
         ebay_id, fee = self._update_item(ItemEWS.Type.add, item_file)
@@ -240,7 +238,6 @@ class ItemEWS(EWS):
                                  os.path.join(self.item_file_dir, item_file))
         return ebay_id, fee
 
-
     def revise_item(self, item_file):
         ebay_id, fee = self._update_item(ItemEWS.Type.revise, item_file)
         now = time.time()
@@ -249,10 +246,9 @@ class ItemEWS(EWS):
                                  os.path.join(self.item_file_dir, item_file))
         return ebay_id, fee
 
-    def update_item(self, upload_type, item_file):
-        fun = self.add_item if upload_type == ItemEWS.Type.add else self.revise_item
-        return fun(item_file)
-
+    # def update_item(self, upload_type, item_file):
+    #     fun = self.add_item if upload_type == ItemEWS.Type.add else self.revise_item
+    #     return fun(item_file)
 
     def upload_item_by_batch(self, upload_type, batch_item_file):
         abs_batch_item_file_path = os.path.join(self.item_file_dir, batch_item_file)
@@ -264,7 +260,7 @@ class ItemEWS(EWS):
                     break
                 item_file = os.path.join(item_file_dir, item_file)
                 try:
-                    ebay_id, fee = self.update_item(update_type, item_file) 
+                    ebay_id, fee = self._update_item(update_type, item_file) 
                 except Exception as e:
                     print('{}:{}'.format(item_file, str(e)))
                 else:
@@ -274,7 +270,7 @@ class ItemEWS(EWS):
         abs_item_file = self._get_abs_item_file_path(item_file)
         item_dict = jreader.read(abs_item_file)
         ebay_id = item_dict['ebay_id']
-        relisted_ebay_id = self._get_item_ebay_info(ebay_id, None, 'RelistedItemID')
+        relisted_ebay_id = self._get_item_info_from_ebay(ebay_id, None, 'RelistedItemID')
         if relisted_ebay_id:
             jreader.update_json_file({'ebay_id':relisted_ebay_id}, abs_item_file)
             return relisted_ebay_id
@@ -377,10 +373,6 @@ if __name__ == '__main__':
     upload_type_dict = {'additem': ItemEWS.Type.add, 'reviseitem': ItemEWS.Type.revise}
     operation_type = sys.argv[1]
     batch_file = sys.argv[2] if len(sys.argv) > 1 else None
-    # if batch_file:
-    #     abs_batch_file_path = batch_file if os.path.isabs(batch_file) else os.path.abspath(batch_file)
-    #     item_file_dir = os.path.dirname(abs_batch_file_path)
-    #     batch_file_name = os.path.basename(abs_batch_file_path)
     if operation_type in upload_type_dict:
         ews = ItemEWS()
         if batch_file:
